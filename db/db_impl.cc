@@ -1189,6 +1189,7 @@ void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
 }
 
 // Convenience methods
+// WriteOptions用来决定是否同步flush
 Status DBImpl::Put(const WriteOptions& o, const Slice& key, const Slice& val) {
   return DB::Put(o, key, val);
 }
@@ -1197,14 +1198,20 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
   return DB::Delete(options, key);
 }
 
+// PUT.2
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   Writer w(&mutex_);
   w.batch = updates;
   w.sync = options.sync;
   w.done = false;
 
-  MutexLock l(&mutex_);
-  writers_.push_back(&w);
+  MutexLock l(&mutex_); // 加锁
+  writers_.push_back(&w); // Q: writers可能包含多个任务吗？
+
+  /* 生产者线程把w放入deque后就开始在while里面睡眠，在两种情况下被唤醒:
+   * 1.刚加入的这个任务被处理：done == true,退出循环直接返回
+   * 2.加入的这个任务位于队列的头部，这个生产者线程变成消费者线程开始后面的处理
+   */
   while (!w.done && &w != writers_.front()) {
     w.cv.Wait();
   }
@@ -1213,10 +1220,13 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   }
 
   // May temporarily unlock and wait.
-  Status status = MakeRoomForWrite(updates == nullptr);
-  uint64_t last_sequence = versions_->LastSequence();
+  Status status = MakeRoomForWrite(updates == nullptr); // 检查内存空间
+  uint64_t last_sequence = versions_->LastSequence(); // 获取已写入数据的最大编号
   Writer* last_writer = &w;
+  // memtable仍有空间
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
+
+    // 先把deque writers_ 里面的写请求做请求合并，last_writer记录本次消费的最后一个请求
     WriteBatch* write_batch = BuildBatchGroup(&last_writer);
     WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
     last_sequence += WriteBatchInternal::Count(write_batch);
@@ -1227,15 +1237,16 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     // into mem_.
     {
       mutex_.Unlock();
+      // 写入log文件，以posix实现为例，最终会有write()系统调用
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
       bool sync_error = false;
       if (status.ok() && options.sync) {
-        status = logfile_->Sync();
+        status = logfile_->Sync(); // flush落盘
         if (!status.ok()) {
           sync_error = true;
         }
       }
-      if (status.ok()) {
+      if (status.ok()) { // 落盘成功，写入mem
         status = WriteBatchInternal::InsertInto(write_batch, mem_);
       }
       mutex_.Lock();
@@ -1251,7 +1262,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     versions_->SetLastSequence(last_sequence);
   }
 
-  while (true) {
+  while (true) { // 把本次消费的所有writer都唤醒
     Writer* ready = writers_.front();
     writers_.pop_front();
     if (ready != &w) {
@@ -1263,7 +1274,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   }
 
   // Notify new head of write queue
-  if (!writers_.empty()) {
+  if (!writers_.empty()) { // 唤醒等待的队首，充当下一次消费者
     writers_.front()->cv.Signal();
   }
 
@@ -1294,7 +1305,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   ++iter;  // Advance past "first"
   for (; iter != writers_.end(); ++iter) {
     Writer* w = *iter;
-    if (w->sync && !first->sync) {
+    if (w->sync && !first->sync) { // 同步写不与异步写合并，异步写单独作为一个write_batch
       // Do not include a sync write into a batch handled by a non-sync write.
       break;
     }
@@ -1309,6 +1320,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
       // Append to *result
       if (result == first->batch) {
         // Switch to temporary batch instead of disturbing caller's batch
+        // 把result清空了，按照指定格式重新打包一遍，写法比较神奇
         result = tmp_batch_;
         assert(WriteBatchInternal::Count(result) == 0);
         WriteBatchInternal::Append(result, first->batch);
@@ -1480,6 +1492,7 @@ void DBImpl::GetApproximateSizes(const Range* range, int n, uint64_t* sizes) {
 
 // Default implementations of convenience methods that subclasses of DB
 // can call if they wish
+// PUT.1
 Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
   WriteBatch batch;
   batch.Put(key, value);
